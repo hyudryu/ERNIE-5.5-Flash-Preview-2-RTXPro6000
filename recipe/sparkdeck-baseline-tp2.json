@@ -1,0 +1,63 @@
+{
+ "model": "baidu/ERNIE-5.5-Flash-Preview",
+ "alias": "ERNIE-5.5-Flash 2x RTX PRO 6000 TP2 (baseline)",
+ "runtime": "vllm",
+ "kind": "managed",
+ "node_ids": [
+  "local"
+ ],
+ "deployment_mode": "single",
+ "settings": {
+  "image": "vllm/vllm-openai:ernie-5.5-flash",
+  "port": 8000,
+  "gpu_memory_utilization": 0.985,
+  "environment": {
+   "HF_HUB_OFFLINE": "1",
+   "VLLM_ENGINE_READY_TIMEOUT_S": "3600"
+  },
+  "tensor_parallel_size": 2,
+  "context_length": 524288,
+  "max_concurrency": 64,
+  "launch_controls": {
+   "context_window": 140000,
+   "max_concurrency": 8,
+   "tensor_parallel_size": 2,
+   "kv_cache_dtype": "fp8",
+   "speculative_method": "dspark",
+   "draft_sample_method": "probabilistic",
+   "dspark_num_speculative_tokens": 7
+  },
+  "extra_args": [
+   "--served-model-name",
+   "ernie-5.5-flash",
+   "--trust-remote-code",
+   "--revision",
+   "ace1100dcde7bf4eb06add6ae11ce4f43a11ddfe",
+   "--kv-cache-dtype",
+   "fp8",
+   "--max-model-len",
+   "140000",
+   "--max-num-seqs",
+   "8",
+   "--disable-custom-all-reduce",
+   "-tp",
+   "2",
+   "--reasoning-parser",
+   "ernie5",
+   "--tool-call-parser",
+   "ernie5",
+   "--enable-auto-tool-choice",
+   "--enable-prompt-tokens-details",
+   "--speculative-config",
+   "{\"method\":\"dspark\",\"num_speculative_tokens\":7,\"draft_sample_method\":\"probabilistic\"}",
+   "--kv-cache-memory",
+   "6264723129"
+  ],
+  "runtime_file_mounts": [
+   {
+    "source": "<repo>/patch/sm120/vllm_ernie/models/ernie5_5/nvidia/attention.py",
+    "target": "/opt/vLLM-ERNIE/src/vllm_ernie/models/ernie5_5/nvidia/attention.py"
+   }
+  ]
+ }
+}
