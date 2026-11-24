@@ -141,11 +141,25 @@ TTFT at C1 (s), baseline → V1: 2.3 → 2.3 (16K), 4.6 → 4.8 (32K),
    `--kv-cache-memory 8391956153`. Peak use through a 498K-token prefill was
    97,027 of 97,887 MiB.
 
+Where the time goes now (C1, 17–19 ms per step): about half is FP8/FP4 GEMMs
+that already run near the memory-bandwidth limit of the weights they read,
+10% is DeepGEMM's split-K reductions, 9% cross-GPU all-reduce, 9% the fp32
+router GEMM, 7% attention. No single remaining item is worth more than about
+3%, and the last probe below came out inside the noise, so V1 is where the
+exact, flag-and-overlay work stops paying. The larger items left need a
+DeepGEMM rebuild (a block smaller than 64 rows) or a working custom
+all-reduce.
+
 Tried and dropped:
 
 - **vLLM custom all-reduce.** Still faults on this machine (it starts, then
   dies on the first request), with `iommu=pt` set and P2P reported OK. NCCL
   all-reduce is about 21% of a C8 step, so this is the largest known cost left.
+- **No auxiliary-stream overlap** (`VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD=0`).
+  Mean step time 19.0 / 24.5 / 29.8 / 40.3 ms at C1 / C2 / C4 / C8 against
+  V1's 19.5 / 25.5 / 30.6 / 40.8, which is inside run-to-run variation.
+- **Merging the two MoE all-reduces per layer.** The profile puts the saving
+  at about 1% of a step, so it was not built.
 - **Smaller expert block.** Capping DeepGEMM's block at 32 rows fails its
   SM120 heuristic (`not candidates.empty()`); the heuristic is compiled into
   the extension.
