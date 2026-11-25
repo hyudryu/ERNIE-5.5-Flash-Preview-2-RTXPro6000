@@ -29,10 +29,13 @@ def run():
         p = d + "\n\nWhat is the secret code mentioned in the text above? Reply with the number only."
         a = ask(p, 1, True); b = ask(p, 12, False)
         top = a["choices"][0]["logprobs"]["content"][0]["top_logprobs"]
-        out[f"{n_words}w"] = {"prompt_tokens": a["usage"]["prompt_tokens"], "code": code,
-                              "answer": b["choices"][0]["message"]["content"].strip(),
-                              "top": [[t["token"], round(t["logprob"], 4)] for t in top]}
-        print(n_words, a["usage"]["prompt_tokens"], code, out[f"{n_words}w"]["answer"], out[f"{n_words}w"]["top"][:3], flush=True)
+        # Two cases share a length, so the key carries the needle position too.
+        key = f"{n_words}w@{at}"
+        assert key not in out, key
+        out[key] = {"prompt_tokens": a["usage"]["prompt_tokens"], "code": code,
+                    "answer": b["choices"][0]["message"]["content"].strip(),
+                    "top": [[t["token"], round(t["logprob"], 4)] for t in top]}
+        print(key, a["usage"]["prompt_tokens"], code, out[key]["answer"], out[key]["top"][:3], flush=True)
     return out
 
 mode, path = sys.argv[1], sys.argv[2]
@@ -41,6 +44,9 @@ if mode == "save":
     json.dump(res, open(path, "w"), indent=1)
 else:
     ref = json.load(open(path)); worst = 0.0
+    missing = sorted(set(res) ^ set(ref))
+    if missing:
+        sys.exit(f"reference and current cases differ: {missing}; re-save the reference")
     for k, v in res.items():
         r = dict(map(tuple, ref[k]["top"])); c = dict(map(tuple, v["top"]))
         d = max((abs(r[t] - c[t]) for t in r if t in c), default=9.9)

@@ -166,7 +166,8 @@ most of it was padding.
 
 The layout changes move where pages sit, not what is stored.
 `tests/test_layout_regression.py` checks needle retrieval and the first
-generated token at 100, 7K, 47K and 153K prompt tokens against the V1
+generated token at 100, 7K, 47K (needle early and late) and 153K prompt
+tokens against the V1
 layout; all pass, with the same run-to-run logprob noise as two runs of the
 same build.
 
