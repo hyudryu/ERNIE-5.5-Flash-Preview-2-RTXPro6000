@@ -1,0 +1,26 @@
+--- a/vLLM-ERNIE/src/vllm_ernie/models/ernie5_5/nvidia/moe.py
++++ b/vLLM-ERNIE/src/vllm_ernie/models/ernie5_5/nvidia/moe.py
+@@ -132,13 +132,22 @@
+     kofs = tl.arange(0, TOPK_PAD)
+     scores = tl.load(scores_ptr + row * stride + offs)
+     sel = scores + tl.load(bias_ptr + offs)
++    # A non-finite row (uninitialized padding or dummy-run inputs) must still
++    # pick TOPK distinct experts: with NaNs nothing equals `best`, every pick
++    # collapsed to E - 1, and the reorder below then summed the duplicates
++    # into an out-of-range id that faulted in the expert scatter.
++    sel = tl.where(sel != sel, float("-inf"), sel)
++    taken = offs < 0
+     ids = tl.full((TOPK_PAD,), E, dtype=tl.int32)
+     vals = tl.zeros((TOPK_PAD,), dtype=tl.float32)
+     weights = tl.zeros((TOPK_PAD,), dtype=tl.float32)
+     for k in tl.static_range(TOPK):
+         best = tl.max(sel, 0)
+-        idx = tl.minimum(tl.min(tl.where(sel == best, offs, E), 0), E - 1)
++        idx = tl.minimum(
++            tl.min(tl.where((sel == best) & (taken == 0), offs, E), 0), E - 1
++        )
+         hit = offs == idx
++        taken = taken | hit
+         ids = tl.where(kofs == k, idx, ids)
+         vals = tl.where(kofs == k, best, vals)
+         weights = tl.where(kofs == k, tl.sum(tl.where(hit, scores, 0.0), 0), weights)

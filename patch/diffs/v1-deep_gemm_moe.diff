@@ -1,0 +1,178 @@
+--- a/vllm/model_executor/layers/fused_moe/experts/deep_gemm_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/deep_gemm_moe.py
+@@ -37,6 +37,7 @@
+     kMxfp8Static,
+ )
+ from vllm.platforms import current_platform
++from vllm.triton_utils import tl, tldevice, triton
+ from vllm.utils.deep_gemm import (
+     DeepGemmQuantScaleFMT,
+     get_mk_alignment_for_contiguous_layout,
+@@ -136,6 +137,104 @@
+     return True
+ 
+ 
++@triton.jit
++def _situ_mul_quant_rows_kernel(
++    x_ptr,
++    rows_ptr,
++    topk_ptr,
++    out_ptr,
++    scale_ptr,
++    x_stride,
++    out_stride,
++    scale_stride_k,
++    num_out_rows,
++    beta,
++    linear_beta,
++    D: tl.constexpr,
++    BLOCK: tl.constexpr,
++    FP8_MAX: tl.constexpr,
++):
++    # One program per (real row, 4 quant groups = one packed scale int32).
++    # Rows are the X grid dimension: prefill has more than 65,535 of them.
++    # Slots with a negative expert id were never routed, and their row index
++    # was never written (same rule as the scatter and gather kernels).
++    if tl.load(topk_ptr + tl.program_id(0)) < 0:
++        return
++    row = tl.load(rows_ptr + tl.program_id(0)).to(tl.int64)
++    if row < 0 or row >= num_out_rows:
++        return
++    pack = tl.program_id(1)
++    cols = pack * 4 * BLOCK + tl.arange(0, 4 * BLOCK)
++    x_row = x_ptr + row * x_stride
++    gate = tl.load(x_row + cols).to(tl.float32)
++    up = tl.load(x_row + D + cols).to(tl.float32)
++    gate = beta * tldevice.tanh(gate / beta) * tl.sigmoid(gate)
++    up = linear_beta * tldevice.tanh(up / linear_beta)
++    # Round to the activation dtype first, as the unfused kernels do.
++    y = (gate * up).to(x_ptr.dtype.element_ty).to(tl.float32)
++    y = tl.reshape(y, (4, BLOCK))
++    amax = tl.maximum(tl.max(tl.abs(y), axis=1), 1e-10)
++    exponent = tl.ceil(tl.log2(amax * (1.0 / FP8_MAX)))
++    y_q = tl.clamp(y * tl.math.exp2(-exponent)[:, None], -FP8_MAX, FP8_MAX)
++    tl.store(
++        out_ptr + row * out_stride + cols,
++        tl.reshape(y_q, (4 * BLOCK,)).to(out_ptr.dtype.element_ty),
++    )
++    shifts = tl.arange(0, 4) * 8
++    packed = tl.sum((exponent.to(tl.int32) + 127) << shifts, axis=0)
++    tl.store(scale_ptr + pack * scale_stride_k + row, packed)
++
++
++def situ_mul_quant_fp8_packed_rows(
++    input: torch.Tensor,
++    output_q: torch.Tensor,
++    rows: torch.Tensor,
++    topk_ids: torch.Tensor,
++    beta: float,
++    linear_beta: float,
++    block_k: int,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """SITU gate*up + 1x128 UE8M0 FP8 quant on the listed rows only.
++
++    Equivalent to ``situ_and_mul`` followed by
++    ``per_token_group_quant_fp8_packed_for_deepgemm``, but it touches only the
++    rows in ``rows`` (the real token rows of the grouped layout). Padding rows
++    of ``output_q`` and of the scales stay uninitialized; the grouped GEMM
++    never returns their results. ``rows`` and ``topk_ids`` are the flattened
++    ``inv_perm`` and expert ids of the same (token, k) slots.
++    """
++    m_sum, n = input.shape
++    d = n // 2
++    packs = d // (4 * block_k)
++    aligned = ((m_sum + 3) // 4) * 4
++    scale = torch.empty_strided(
++        (m_sum, packs), (1, aligned), dtype=torch.int32, device=input.device
++    )
++    num_rows = rows.numel()
++    if num_rows:
++        _situ_mul_quant_rows_kernel[(num_rows, packs)](
++            input,
++            rows,
++            topk_ids,
++            output_q,
++            scale,
++            input.stride(0),
++            output_q.stride(0),
++            scale.stride(1),
++            m_sum,
++            beta,
++            linear_beta,
++            D=d,
++            BLOCK=block_k,
++            FP8_MAX=torch.finfo(torch.float8_e4m3fn).max,
++            num_warps=4,
++            # No FMA contraction, so each op rounds like the unfused kernels.
++            enable_fp_fusion=False,
++        )
++    return output_q, scale
++
++
++
+ class DeepGemmExperts(mk.FusedMoEExpertsModular):
+     """DeepGemm-based fused MoE expert implementation."""
+ 
+@@ -545,7 +644,12 @@
+         return (workspace1, workspace2, output)
+ 
+     def _act_mul_quant(
+-        self, input: torch.Tensor, output: torch.Tensor, activation: MoEActivation
++        self,
++        input: torch.Tensor,
++        output: torch.Tensor,
++        activation: MoEActivation,
++        rows: torch.Tensor | None = None,
++        topk_ids: torch.Tensor | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         block_k = self._ACT_BLOCK_K
+         scale_fmt = DeepGemmQuantScaleFMT.from_oracle()
+@@ -553,6 +657,34 @@
+         M_sum, N = input.size()
+         activation_out_dim = self.adjust_N_for_activation(N, activation)
+ 
++        # SITU on the real rows only: with one token per expert the grouped
++        # layout is almost all padding (64 rows per active expert).
++        situ_beta = self.moe_config.activation_situ_beta
++        situ_linear_beta = self.moe_config.activation_situ_linear_beta
++        if (
++            rows is not None
++            and topk_ids is not None
++            and rows.is_contiguous()
++            and topk_ids.is_contiguous()
++            and activation == MoEActivation.SITU
++            and scale_fmt == DeepGemmQuantScaleFMT.UE8M0
++            and situ_linear_beta is not None
++            and situ_linear_beta > 0
++            and input.dtype == torch.bfloat16
++            and activation_out_dim * 2 == N
++            and activation_out_dim % (4 * block_k) == 0
++            and rows.numel() < M_sum
++        ):
++            return situ_mul_quant_fp8_packed_rows(
++                input,
++                output,
++                rows.view(-1),
++                topk_ids.view(-1),
++                float(situ_beta or 1.0),
++                float(situ_linear_beta),
++                block_k,
++            )
++
+         if activation == MoEActivation.SILU:
+             # Fused gate+mul+quant kernels for the common SILU case.
+             if scale_fmt == DeepGemmQuantScaleFMT.UE8M0:
+@@ -666,7 +798,12 @@
+                 workspace13.view(dtype=torch.float8_e4m3fn), (M_sum, activation_out_dim)
+             )
+             a2q, a2q_scale = self._act_mul_quant(
+-                input=mm1_out.view(-1, N), output=quant_out, activation=activation
++                input=mm1_out.view(-1, N),
++                output=quant_out,
++                activation=activation,
++                # expert_map (EP) remaps ids; keep the stock path there.
++                rows=inv_perm if expert_map is None else None,
++                topk_ids=topk_ids,
+             )
+ 
+             # FC2: FP8 activations x FP4 weights

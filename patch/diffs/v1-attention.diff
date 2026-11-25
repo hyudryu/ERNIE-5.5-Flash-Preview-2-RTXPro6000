@@ -1,0 +1,182 @@
+--- a/vLLM-ERNIE/src/vllm_ernie/models/ernie5_5/nvidia/attention.py
++++ b/vLLM-ERNIE/src/vllm_ernie/models/ernie5_5/nvidia/attention.py
+@@ -53,6 +53,7 @@
+ from vllm.models.deepseek_v4.compressor import DeepseekCompressor
+ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
+     DeepseekV4FlashInferMLAAttention,
++    DeepseekV4FlashInferSM120Attention,
+ )
+ from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
+ from vllm.models.deepseek_v4.nvidia.ops.o_proj import deep_gemm_fp8_o_proj
+@@ -72,6 +73,14 @@
+     CommonAttentionMetadata,
+     MultipleOf,
+ )
++from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
++    FlashInferMLASparseMetadataBuilder,
++    FlashInferMLASparseSM120Backend,
++    max_decode_query_len,
++)
++from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm120 import (
++    FlashInferMLASparseSM120Impl,
++)
+ from vllm.v1.attention.backends.mla.flashmla_sparse import (
+     FlashMLASparseBackend,
+     FlashMLASparseImpl,
+@@ -566,8 +575,35 @@
+     """HCA layer on FlashMLA sparse MLA (``fp8_ds_mla`` KV cache)."""
+ 
+ 
++class Ernie5_5HCAFlashInferSM120Attention(
++    Ernie5_5HCAAttentionMixin, DeepseekV4FlashInferSM120Attention
++):
++    """HCA layer on FlashInfer's SM120 sparse MLA (``fp8_ds_mla`` KV cache)."""
++
++    def forward_mqa(self, q, kv, positions, output):  # type: ignore[override]
++        super().forward_mqa(q, kv, positions, output)
++        # The SM120 kernels only write the rows of real tokens. CUDA-graph
++        # padding rows keep whatever the buffer held; left alone they grow to
++        # inf/NaN across layers and fault in the expert routing downstream.
++        attn_metadata = get_forward_context().attn_metadata
++        if isinstance(attn_metadata, dict):
++            swa_metadata = attn_metadata.get(self.swa_cache_layer.prefix)
++            valid = getattr(swa_metadata, "is_valid_token", None)
++            if valid is not None and valid.shape[0] >= output.shape[0]:
++                output.masked_fill_(~valid[: output.shape[0]].view(-1, 1, 1), 0)
++
++
++def _is_sm12x() -> bool:
++    capability = current_platform.get_device_capability()
++    return capability is not None and capability.major == 12
++
++
+ def select_ernie5_5_hca_cls(kv_cache_dtype: str) -> type[DeepseekV4Attention]:
+     """FlashInfer for the plain bf16 KV row, FlashMLA for ``fp8_ds_mla``."""
++    if _is_sm12x():
++        # FlashMLA ships SM90/SM100 kernels only; SM120 serves the packed
++        # fp8_ds_mla layout through FlashInfer's SM120 sparse-MLA kernels.
++        return Ernie5_5HCAFlashInferSM120Attention
+     if kv_cache_dtype.startswith("fp8"):
+         return Ernie5_5HCAFlashMLAAttention
+     return Ernie5_5HCAFlashInferAttention
+@@ -835,12 +871,102 @@
+         return True
+ 
+ 
++class Ernie5_5FlashInferSM120SparseImpl(FlashInferMLASparseSM120Impl):
++    """FlashInfer SM120 sparse impl that passes the per-head sink to the kernel."""
++
++    def __init__(self, *args, **kwargs) -> None:
++        self.sinks: torch.Tensor = kwargs.pop("sinks")
++        super().__init__(*args, **kwargs)
++
++    def _run_mqa_kernel(
++        self,
++        q: torch.Tensor,
++        kv_cache: torch.Tensor,
++        topk_indices_physical: torch.Tensor,
++    ) -> torch.Tensor:
++        from vllm.utils.flashinfer import (
++            flashinfer_trtllm_batch_decode_with_kv_cache_mla,
++        )
++        from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
++            _get_workspace_buffer,
++        )
++
++        num_actual_toks = q.shape[0]
++        output = q.new_empty(
++            (num_actual_toks, self.num_heads, self.kv_lora_rank), dtype=q.dtype
++        )
++        if self._workspace_buffer is None:
++            self._workspace_buffer = _get_workspace_buffer(q.device)
++        sparse_capacity = topk_indices_physical.shape[1]
++        out = flashinfer_trtllm_batch_decode_with_kv_cache_mla(
++            query=q.unsqueeze(1),
++            kv_cache=kv_cache.view(torch.uint8).unsqueeze(1),
++            workspace_buffer=self._workspace_buffer,
++            qk_nope_head_dim=self.qk_nope_head_dim,
++            kv_lora_rank=self.kv_lora_rank,
++            qk_rope_head_dim=self.qk_rope_head_dim,
++            block_tables=topk_indices_physical.unsqueeze(1),
++            seq_lens=None,
++            max_seq_len=sparse_capacity,
++            out=output.unsqueeze(1),
++            bmm1_scale=self.scale,
++            bmm2_scale=1.0,
++            sparse_mla_top_k=sparse_capacity,
++            kv_scale_format=self.kv_scale_format,
++            sinks=[self.sinks],
++        )
++        return out.squeeze(1)
++
++
++class Ernie5_5FlashInferSM120SparseMetadataBuilder(FlashInferMLASparseMetadataBuilder):
++    """Lets FULL decode graphs replay variable-length verification batches."""
++
++    @classmethod
++    def get_varlen_cudagraph_max_query_len(
++        cls, vllm_config: VllmConfig, kv_cache_spec: KVCacheSpec
++    ) -> int | None:
++        # The SM120 impl maps every token through req_id_per_token, which is
++        # built from the device request boundaries, so decode is varlen-safe.
++        return max_decode_query_len(vllm_config)
++
++
++class Ernie5_5FlashInferSM120SparseBackend(FlashInferMLASparseSM120Backend):
++    """Sink-capable sparse MLA backend for SM120 (RTX PRO 6000 Blackwell)."""
++
++    get_supported_kernel_block_sizes = staticmethod(_dsa_kernel_block_sizes)
++
++    @staticmethod
++    def get_builder_cls() -> type[Ernie5_5FlashInferSM120SparseMetadataBuilder]:
++        return Ernie5_5FlashInferSM120SparseMetadataBuilder
++
++    @staticmethod
++    def get_impl_cls() -> type[Ernie5_5FlashInferSM120SparseImpl]:
++        return Ernie5_5FlashInferSM120SparseImpl
++
++    @classmethod
++    def supports_sink(cls) -> bool:
++        return True
++
++
++def select_ernie5_5_dsa_backend() -> type[AttentionBackend]:
++    if _is_sm12x():
++        return Ernie5_5FlashInferSM120SparseBackend
++    return Ernie5_5FlashMLASparseBackend
++
++
+ class Ernie5_5IndexerBackend(DeepseekV32IndexerBackend):
+     # Keeps the parent name: shared MLA code keys on it.
+ 
+     get_supported_kernel_block_sizes = staticmethod(_dsa_kernel_block_sizes)
+ 
+     @classmethod
++    def supports_device_cpu_query_lens_mismatch(cls) -> bool:
++        # SM120 always flattens spec-decode queries into single-token rows
++        # (no native next_n > 2 kernel), and that path expands the rows from
++        # the device decode lengths, so adaptive verification can trim them.
++        return super().supports_device_cpu_query_lens_mismatch() or _is_sm12x()
++
++    @classmethod
+     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+         # The 64-token DSA pages are packed beside the 256-token HCA pages
+         # inside each block, so the block dim must be outermost.
+@@ -1102,7 +1228,7 @@
+     capability = current_platform.get_device_capability()
+     if capability is None:
+         raise RuntimeError("ERNIE 5.5 DSA needs a known CUDA device capability.")
+-    invalid_reasons = Ernie5_5FlashMLASparseBackend.validate_configuration(
++    invalid_reasons = select_ernie5_5_dsa_backend().validate_configuration(
+         head_size=head_size,
+         dtype=torch.get_default_dtype(),
+         kv_cache_dtype=cast(CacheDType, kv_cache_dtype),
+@@ -1229,7 +1355,7 @@
+             cache_config=cache_config,
+             quant_config=quant_config,
+             prefix=f"{prefix}.attn",
+-            attn_backend=Ernie5_5FlashMLASparseBackend,
++            attn_backend=select_ernie5_5_dsa_backend(),
+             use_sparse=True,
+             indexer=self.indexer,
+             topk_indices_buffer=swa_topk_buffer,
