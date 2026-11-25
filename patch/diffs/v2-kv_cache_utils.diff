@@ -1,0 +1,90 @@
+--- /home/hyudryu/work/ernie55/vllm032/vllm/v1/core/kv_cache_utils.py	2026-10-17 20:08:32.000000000 -0700
++++ patch/v2/vllm/v1/core/kv_cache_utils.py	2026-11-24 17:47:31.397021830 -0800
+@@ -5,6 +5,7 @@
+ import copy
+ import hashlib
+ import math
++from collections import Counter
+ import os
+ from collections import defaultdict
+ from collections.abc import Callable, Iterable, Iterator, Sequence
+@@ -1627,6 +1628,47 @@
+     num_blocks = available_memory // bytes_per_block
+     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+     size = bytes_per_block * num_blocks
++    logger.info_once(
++        "KV layout: %d blocks of %d bytes; groups (block_size, layers, bytes used)=%s",
++        num_blocks,
++        bytes_per_block,
++        str(
++            [
++                (
++                    g.kv_cache_spec.block_size,
++                    len(g.layer_names),
++                    sum(
++                        _get_per_layer_spec(g, n).page_size_bytes
++                        for n in g.layer_names
++                    ),
++                )
++                for g in kv_cache_groups
++            ]
++        ),
++    )
++
++    logger.info_once(
++        "KV layer specs (type, block_size, page_bytes, stride_align, count)=%s",
++        str(
++            sorted(
++                (
++                    (
++                        type(sp).__name__,
++                        sp.block_size,
++                        sp.page_size_bytes,
++                        sp.get_block_stride_alignment(),
++                        cnt,
++                    )
++                    for sp, cnt in Counter(
++                        _get_per_layer_spec(g, n)
++                        for g in kv_cache_groups
++                        for n in g.layer_names
++                    ).items()
++                ),
++                key=str,
++            )
++        ),
++    )
+ 
+     # Groups alias from byte 0. Spec regions are laid out differently:
+     #
+@@ -1958,9 +2000,31 @@
+         default=0,
+     )
+ 
++    # ERNIE V2: a single-page-size bucket does not have to follow the repeat
++    # pattern. Split it into the fewest groups whose widest member still fits
++    # the block the mixed bucket already needs. For ERNIE 5.5 this puts all 37
++    # HCA compressed caches (1.7 KB per block each) in one group instead of
++    # five groups that each fill under 4% of a 378 KB block.
++    # The block is strided by the anchor rounded up to every layer's stride
++    # alignment, so groups may fill that rounded size.
++    stride_bytes = round_up(
++        anchor_bytes,
++        math.lcm(*(s.get_block_stride_alignment() for s in kv_cache_spec.values())),
++    )
++
++    def tight_num_groups(page_size_layers: dict[int, list[str]], n: int) -> int:
++        if not anchor_bytes or len(page_size_layers) != 1:
++            return n
++        for m in range(1, n + 1):
++            if widest_group_bytes(page_size_layers, m) <= stride_bytes:
++                return m
++        return n
++
+     groups = []
+     for spec, page_size_layers, balanced in bucketed:
+         num_groups = num_groups_for(spec, balanced)
++        if not is_state_bucket(spec):
++            num_groups = tight_num_groups(page_size_layers, num_groups)
+         # Cap a state group at the states a block already fits rather than let
+         # it widen the block.
+         if anchor_bytes and is_state_bucket(spec):

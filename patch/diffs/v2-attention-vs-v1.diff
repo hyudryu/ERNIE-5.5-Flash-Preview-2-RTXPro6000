@@ -1,0 +1,91 @@
+--- patch/v1/vllm_ernie/models/ernie5_5/nvidia/attention.py	2026-11-24 14:04:04.900030017 -0800
++++ patch/v2/vllm_ernie/models/ernie5_5/nvidia/attention.py	2026-11-24 17:47:31.397197331 -0800
+@@ -5,6 +5,7 @@
+ import copy
+ import dataclasses
+ import math
++import os
+ from typing import cast
+ 
+ import torch
+@@ -53,6 +54,7 @@
+ from vllm.models.deepseek_v4.compressor import DeepseekCompressor
+ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
+     DeepseekV4FlashInferMLAAttention,
++    DeepseekV4FlashInferMLASparseBackend,
+     DeepseekV4FlashInferSM120Attention,
+ )
+ from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
+@@ -120,6 +122,11 @@
+ VHA_RANK = 16
+ # FlashMLA sparse and the paged MQA logits kernels both use 64-token pages.
+ DSA_BLOCK_SIZE = 64
++# Tokens per KV block of the HCA compressed cache. FlashInfer's SM120 kernels
++# are compiled for 2 or 64 compressed entries per block only, i.e. 256 or
++# 8,192 tokens. 8,192 packs the cache 6x tighter (about +20% pool) but prefix
++# cache hits then land on 8,192-token boundaries, so it stays opt-in.
++HCA_BLOCK_TOKENS = int(os.environ.get("ERNIE_HCA_BLOCK_TOKENS", "256"))
+ INDEXER_QUANT_BLOCK = 128
+ 
+ 
+@@ -575,11 +582,26 @@
+     """HCA layer on FlashMLA sparse MLA (``fp8_ds_mla`` KV cache)."""
+ 
+ 
++class Ernie5_5HCAFlashInferSM120Backend(DeepseekV4FlashInferMLASparseBackend):
++    """Same backend, also taking ``HCA_BLOCK_TOKENS``-token blocks whole.
++
++    The SM120 kernels receive the entries per block as an argument (64 for the
++    SWA cache, 2 for the stock compressed cache), so a larger compressed block
++    needs no kernel-block splitting.
++    """
++
++    @staticmethod
++    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
++        return sorted({256, HCA_BLOCK_TOKENS})
++
++
+ class Ernie5_5HCAFlashInferSM120Attention(
+     Ernie5_5HCAAttentionMixin, DeepseekV4FlashInferSM120Attention
+ ):
+     """HCA layer on FlashInfer's SM120 sparse MLA (``fp8_ds_mla`` KV cache)."""
+ 
++    backend_cls = Ernie5_5HCAFlashInferSM120Backend
++
+     def forward_mqa(self, q, kv, positions, output):  # type: ignore[override]
+         super().forward_mqa(q, kv, positions, output)
+         # The SM120 kernels only write the rows of real tokens. CUDA-graph
+@@ -592,6 +614,19 @@
+             if valid is not None and valid.shape[0] >= output.shape[0]:
+                 output.masked_fill_(~valid[: output.shape[0]].view(-1, 1, 1), 0)
+ 
++    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
++        # V2 (opt-in, see HCA_BLOCK_TOKENS): a compressed entry covers 128
++        # tokens, so a 256-token block holds two 584-byte entries. The kernels
++        # and the compressor take the block size from the metadata, so only
++        # the spec changes.
++        spec = super().get_kv_cache_spec(vllm_config)
++        if spec is None or HCA_BLOCK_TOKENS <= spec.block_size:
++            return spec
++        assert HCA_BLOCK_TOKENS % spec.block_size == 0
++        return dataclasses.replace(
++            spec, block_size=HCA_BLOCK_TOKENS, page_size_padded=None
++        )
++
+ 
+ def _is_sm12x() -> bool:
+     capability = current_platform.get_device_capability()
+@@ -616,6 +651,13 @@
+     FlashMLA sparse kernels view their bf16 KV caches as flat rows, so the
+     stride must also be a whole number of HCA and DSA rows.
+     """
++    if _is_sm12x() and vllm_config.cache_config.cache_dtype.startswith("fp8"):
++        # V2: the row constraints below are for bf16 caches viewed as flat
++        # rows. The SM120 path stores fp8_ds_mla pages (584 B and 656 B
++        # entries, which the 9,216 B alignment never matched), so only the
++        # MQA logits kernel's 512 B applies. This lets the shared block shrink
++        # from 377,856 to 335,872 bytes.
++        return 512
+     hf_config = vllm_config.model_config.hf_config
+     hca_row = hf_config.head_dim * 2
+     dsa_row = (hf_config.mla_kv_lora_rank + hf_config.mla_qk_rope_head_dim) * 2
