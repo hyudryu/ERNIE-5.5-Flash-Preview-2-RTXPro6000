@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Layout regression check: first-token logprobs and needle retrieval at several
-context lengths. Usage: logprob_check.py save ref.json | logprob_check.py cmp ref.json
+context lengths. Usage: test_layout_regression.py save ref.json | ... cmp ref.json
+cmp exits nonzero if any case misses its needle or changes its first token.
 The first generated token comes from the target model at temperature 0, so its
 top logprobs depend only on the prompt and on what the KV caches hold."""
 import json, random, sys, urllib.request
@@ -43,7 +44,7 @@ res = run()
 if mode == "save":
     json.dump(res, open(path, "w"), indent=1)
 else:
-    ref = json.load(open(path)); worst = 0.0
+    ref = json.load(open(path)); worst = 0.0; failed = []
     missing = sorted(set(res) ^ set(ref))
     if missing:
         sys.exit(f"reference and current cases differ: {missing}; re-save the reference")
@@ -52,4 +53,7 @@ else:
         d = max((abs(r[t] - c[t]) for t in r if t in c), default=9.9)
         ok = str(v["code"]) in v["answer"] and ref[k]["top"][0][0] == v["top"][0][0]
         worst = max(worst, d); print(f"{k}: needle+top1 {'OK' if ok else 'FAIL'}, max |dlogprob| {d:.4f}")
+        if not ok: failed.append(k)
     print("worst", worst)
+    if failed:
+        sys.exit(f"FAILED: wrong needle or changed first token in {failed}")

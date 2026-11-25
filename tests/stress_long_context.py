@@ -17,8 +17,11 @@ def one(args):
         return (d["usage"]["prompt_tokens"], d["usage"]["completion_tokens"], str(code) in d["choices"][0]["message"]["content"], round(time.time() - t, 1))
     except Exception as e:
         return ("ERR", str(e)[:200])
-seed = int(time.time())
+seed = int(time.time()); bad = []
 for spec in sys.argv[1].split(","):
     n, words = map(int, spec.split("x")); seed += 100
     with ThreadPoolExecutor(n) as ex: res = list(ex.map(one, [(words, seed + i) for i in range(n)]))
     print(spec, res, flush=True)
+    bad += [r for r in res if r[0] == "ERR" or not r[2]]
+if bad:
+    sys.exit(f"FAILED: {len(bad)} request(s) errored or missed the needle")
